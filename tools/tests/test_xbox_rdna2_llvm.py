@@ -29,9 +29,10 @@ class SmemTableTest(unittest.TestCase):
         alone = {}
         for op in range(64):
             enc = struct.pack("<2I", 0xF4000000 | (op << 18), 0x7D << 25)
-            d = self.r._decode(enc)
-            if d and d[0][1] == enc:
-                alone[op] = self.r._SUFFIX.sub("", d[0][0])
+            for name, decoded, _ in self.r._decode(self.r._RESYNC + enc + self.r._RESYNC):
+                if decoded == enc:
+                    alone[op] = self.r._SUFFIX.sub("", name)
+                    break
         self.assertEqual({k: v for k, v in self.r.SMEM.items() if k < 64}, alone)
 
 

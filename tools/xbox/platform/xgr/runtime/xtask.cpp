@@ -76,6 +76,7 @@ struct Queue {
 
 namespace {
 
+constexpr HRESULT kNoTaskQueue = static_cast<HRESULT>(0x800701ABu);
 std::atomic<uint64_t> g_next_token{1};
 
 void add_ref(Queue* q) { q->refs.fetch_add(1, std::memory_order_relaxed); }
@@ -239,6 +240,13 @@ Queue* resolve(Queue* q, bool* borrowed) {
   return GetProcessQueue(&proc) ? proc : nullptr;
 }
 
+auto resolve_queue(Queue* q) {
+  bool borrowed;
+  q = resolve(q, &borrowed);
+  auto close = [borrowed](Queue* held) { if (!borrowed) Close(held); };
+  return std::unique_ptr<Queue, decltype(close)>(q, close);
+}
+
 VOID CALLBACK waiter_fired(PVOID p, BOOLEAN) {
   auto* w = static_cast<Waiter*>(p);
   if (Submit(w->q, w->port, w->ctx, w->cb) != S_OK) w->cb(w->ctx, true);
@@ -307,13 +315,16 @@ HRESULT CreateComposite(Port* work, Port* completion, Queue** out) {
 }
 
 HRESULT GetPort(Queue* q, PortId port, Port** out) {
-  if (!q || !out || !valid_port(port)) return E_INVALIDARG;
-  *out = q->ports[static_cast<uint32_t>(port)];
+  if (!out || !valid_port(port)) return E_INVALIDARG;
+  auto resolved = resolve_queue(q);
+  if (!resolved) return kNoTaskQueue;
+  *out = resolved->ports[static_cast<uint32_t>(port)];
   return S_OK;
 }
 
 HRESULT Duplicate(Queue* q, Queue** out) {
-  if (!q || !out) return E_INVALIDARG;
+  if (!out) return E_INVALIDARG;
+  if (!q) return GetProcessQueue(out) ? S_OK : kNoTaskQueue;
   add_ref(q);
   *out = q;
   return S_OK;
@@ -324,7 +335,10 @@ void Close(Queue* q) {
 }
 
 bool Dispatch(Queue* q, PortId port, uint32_t timeout_ms) {
-  if (!q || !valid_port(port)) return false;
+  if (!valid_port(port)) return false;
+  auto resolved = resolve_queue(q);
+  q = resolved.get();
+  if (!q) return false;
   Port* p = q->ports[static_cast<uint32_t>(port)];
   if (p->mode != DispatchMode::Manual) return false;
   Item item;
@@ -349,7 +363,7 @@ HRESULT Submit(Queue* q, PortId port, void* ctx, Callback cb) {
   if (!cb || !valid_port(port)) return E_INVALIDARG;
   bool borrowed = false;
   q = resolve(q, &borrowed);
-  if (!q) return E_INVALIDARG;
+  if (!q) return kNoTaskQueue;
   Item item;
   const bool started = begin_item(q, port, cb, ctx, item);
   if (started) enqueue(q, port, item);
@@ -362,7 +376,7 @@ HRESULT SubmitDelayed(Queue* q, PortId port, uint32_t delay_ms, void* ctx, Callb
   if (!cb || !valid_port(port)) return E_INVALIDARG;
   bool borrowed = false;
   q = resolve(q, &borrowed);
-  if (!q) return E_INVALIDARG;
+  if (!q) return kNoTaskQueue;
   bool started;
   {
     std::lock_guard<std::mutex> lock(g_delay_m);
@@ -382,7 +396,9 @@ HRESULT SubmitDelayed(Queue* q, PortId port, uint32_t delay_ms, void* ctx, Callb
 }
 
 HRESULT Terminate(Queue* q, bool wait, void* ctx, TerminatedCallback cb) {
-  if (!q) return E_INVALIDARG;
+  auto resolved = resolve_queue(q);
+  q = resolved.get();
+  if (!q) return kNoTaskQueue;
   std::map<uint64_t, Waiter*> waiters;
   {
     std::lock_guard<std::mutex> lock(q->m);
@@ -438,23 +454,30 @@ HRESULT Terminate(Queue* q, bool wait, void* ctx, TerminatedCallback cb) {
 
 HRESULT RegisterWaiter(Queue* q, PortId port, HANDLE h, void* ctx, Callback cb,
                        RegistrationToken* tok) {
-  if (!q || !h || !cb || !tok || !valid_port(port)) return E_INVALIDARG;
-  if (is_terminated(q)) return E_ABORT;
-  auto* w = new Waiter{q, port, ctx, cb};
-  add_ref(q);
-  // [inferred] One-shot: the callback is queued once when the handle is signaled.
-  if (!RegisterWaitForSingleObject(&w->wait, h, waiter_fired, w, INFINITE, WT_EXECUTEONLYONCE)) {
-    release(q);
-    delete w;
-    return HRESULT_FROM_WIN32(GetLastError());
-  }
-  tok->token = g_next_token++;
+  if (!h || !cb || !tok || !valid_port(port)) return E_INVALIDARG;
+  auto resolved = resolve_queue(q);
+  q = resolved.get();
+  if (!q) return kNoTaskQueue;
   std::lock_guard<std::mutex> lock(q->m);
-  q->waiters[tok->token] = w;
+  if (q->terminated) return E_ABORT;
+  auto waiter = std::make_unique<Waiter>(Waiter{q, port, ctx, cb});
+  const uint64_t token = g_next_token++;
+  q->waiters.emplace(token, waiter.get());
+  // [inferred] One-shot: the callback is queued once when the handle is signaled.
+  if (!RegisterWaitForSingleObject(&waiter->wait, h, waiter_fired, waiter.get(), INFINITE, WT_EXECUTEONLYONCE)) {
+    const HRESULT error = HRESULT_FROM_WIN32(GetLastError());
+    q->waiters.erase(token);
+    return error;
+  }
+  add_ref(q);
+  waiter.release();
+  tok->token = token;
   return S_OK;
 }
 
 void UnregisterWaiter(Queue* q, RegistrationToken tok) {
+  auto resolved = resolve_queue(q);
+  q = resolved.get();
   if (!q) return;
   Waiter* w = nullptr;
   {
@@ -470,17 +493,26 @@ void UnregisterWaiter(Queue* q, RegistrationToken tok) {
 }
 
 HRESULT RegisterMonitor(Queue* q, void* ctx, MonitorCallback cb, RegistrationToken* tok) {
-  if (!q || !cb || !tok) return E_INVALIDARG;
+  if (!cb || !tok) return E_INVALIDARG;
+  auto resolved = resolve_queue(q);
+  q = resolved.get();
+  if (!q) return kNoTaskQueue;
   tok->token = g_next_token++;
   std::lock_guard<std::mutex> lock(q->m);
   q->monitors[tok->token] = {ctx, cb};
+  add_ref(q);
   return S_OK;
 }
 
 void UnregisterMonitor(Queue* q, RegistrationToken tok) {
+  auto resolved = resolve_queue(q);
+  q = resolved.get();
   if (!q) return;
-  std::lock_guard<std::mutex> lock(q->m);
-  q->monitors.erase(tok.token);
+  {
+    std::lock_guard<std::mutex> lock(q->m);
+    if (!q->monitors.erase(tok.token)) return;
+  }
+  release(q);
 }
 
 bool GetProcessQueue(Queue** out) {
@@ -631,7 +663,8 @@ HRESULT CALLBACK run_provider(AsyncOp op, const AsyncProviderData* data) {
 HRESULT AsyncBegin(AsyncBlock* b, void* ctx, const void* identity, const char*, AsyncProvider p) {
   if (!b || !p) return E_INVALIDARG;
   Queue* q = nullptr;
-  if (b->queue ? FAILED(Duplicate(b->queue, &q)) : !GetProcessQueue(&q)) return E_INVALIDARG;
+  const HRESULT queue_result = Duplicate(b->queue, &q);
+  if (FAILED(queue_result)) return queue_result;
   auto* s = new AsyncState();
   {
     std::lock_guard<std::mutex> lock(g_async_m);
@@ -647,6 +680,11 @@ HRESULT AsyncBegin(AsyncBlock* b, void* ctx, const void* identity, const char*, 
     s->identity = identity;
     s->queue = q;
     s->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!s->done) {
+      const HRESULT error = HRESULT_FROM_WIN32(GetLastError());
+      release(s);
+      return error;
+    }
     *in = {s, E_PENDING, kMagic, 0, 0};
   }
   add_ref(s);  // the provider may complete synchronously

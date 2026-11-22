@@ -30,6 +30,7 @@ import csv
 import mmap
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
@@ -223,6 +224,49 @@ def write_carve(archive, entries, bins, vins, manifest):
     return rows, errors
 
 
+def publish_carve(replacements, previous_paths):
+    backup_dirs = {}
+    backups = {}
+    new_paths = []
+    published = False
+    try:
+        for path in previous_paths:
+            if not os.path.lexists(path):
+                continue
+            parent = os.path.dirname(path) or "."
+            if parent not in backup_dirs:
+                backup_dirs[parent] = tempfile.mkdtemp(prefix=".carve-backup-", dir=parent)
+            backup = os.path.join(backup_dirs[parent], os.path.basename(path))
+            backups[path] = backup
+            os.replace(path, backup)
+
+        for source, path in replacements:
+            if path not in backups:
+                new_paths.append(path)
+            os.replace(source, path)
+        published = True
+    except (OSError, KeyboardInterrupt):
+        for path in reversed(new_paths):
+            try:
+                if os.path.lexists(path):
+                    os.remove(path)
+            except OSError as error:
+                print("could not remove new carved output %s: %s" % (path, error), file=sys.stderr)
+        for path, backup in reversed(list(backups.items())):
+            try:
+                if os.path.lexists(backup):
+                    os.replace(backup, path)
+            except OSError as error:
+                print("could not restore %s; previous output kept at %s: %s" % (path, backup, error), file=sys.stderr)
+        raise
+    finally:
+        for directory in backup_dirs.values():
+            if published:
+                shutil.rmtree(directory)
+            elif not os.listdir(directory):
+                os.rmdir(directory)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("archive", help="path to shaders.rpf")
@@ -272,16 +316,13 @@ def main():
         ):
             staged_manifest = os.path.join(staged_out, "manifest.csv")
             rows, errors = write_carve(archive, entries, staged_bins, staged_vins, staged_manifest)
-            replaced = set()
-            for staged, destination in ((staged_bins, bins), (staged_vins, vins)):
-                for name in os.listdir(staged):
-                    path = os.path.join(destination, name)
-                    os.replace(os.path.join(staged, name), path)
-                    replaced.add(path)
-            for path in managed:
-                if path not in replaced:
-                    os.remove(path)
-            os.replace(staged_manifest, manifest)
+            replacements = [
+                (os.path.join(staged, name), os.path.join(destination, name))
+                for staged, destination in ((staged_bins, bins), (staged_vins, vins))
+                for name in sorted(os.listdir(staged))
+            ]
+            replacements.append((staged_manifest, manifest))
+            publish_carve(replacements, (*managed, manifest))
 
     carved = [row for row in rows if not row["error"]]
     sizes = sorted(row["bytes"] for row in carved)

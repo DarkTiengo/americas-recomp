@@ -269,6 +269,42 @@ class MainTest(unittest.TestCase):
         manifest = (self.out / "manifest.csv").read_text().splitlines()
         self.assertEqual(manifest, [",".join(carve_shaders.FIELDS), "1,VS_Test,1,VS,4,0,"])
 
+    def test_force_restores_previous_run_if_publishing_the_manifest_fails(self):
+        self.archive.write_bytes(b"\x00")
+        vins = self.out / "vin"
+        vins.mkdir()
+        manifest = self.out / "manifest.csv"
+        outputs = (self.bins / "1.bin", self.bins / "3.bin", vins / "1.vin", manifest)
+        for path in outputs:
+            path.write_bytes(b"previous run")
+        unrelated = self.bins / "notes.txt"
+        unrelated.write_bytes(b"keep")
+        generated = {
+            "error": None, "name": "new", "kind": 1, "code": b"new",
+            "vin": "vin\n", "prologue": False,
+        }
+        real_replace = carve_shaders.os.replace
+        refused = False
+
+        def replace(source, destination):
+            nonlocal refused
+            if Path(destination) == manifest and not refused:
+                refused = True
+                raise PermissionError("cannot publish manifest")
+            real_replace(source, destination)
+
+        with (
+            mock.patch.object(carve_shaders, "find_entries", return_value=[("first", 0), ("second", 0)]),
+            mock.patch.object(carve_shaders, "carve_one", return_value=generated),
+            mock.patch.object(carve_shaders.os, "replace", side_effect=replace),
+            self.assertRaisesRegex(PermissionError, "cannot publish manifest"),
+        ):
+            self.run_main("--force")
+        for path in outputs:
+            self.assertEqual(path.read_bytes(), b"previous run")
+        self.assertEqual(unrelated.read_bytes(), b"keep")
+        self.assertEqual(set(self.out.rglob("*")), {self.bins, vins, unrelated, *outputs})
+
     def test_force_removes_only_numbered_blobs(self):
         self.archive.write_bytes(b"\x00")
         managed = ("1.bin", "10.bin")

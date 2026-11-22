@@ -1,11 +1,13 @@
 #include <windows.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -225,8 +227,17 @@ static void CheckTermination() {
   Check(!g_tq.IsEmpty(q, kWork), "XTaskQueueIsEmpty counts a long-delayed callback");
   g_tq.Terminate(q, false);
   Check(!g_tq.IsEmpty(q, kWork), "XTaskQueueIsEmpty still counts the canceled callback until it is dispatched");
-  while (g_tq.Dispatch(q, kWork, 1000)) {
-  }
+  std::promise<void> drained;
+  auto completion = drained.get_future();
+  std::thread dispatcher([&] {
+    while (g_tq.Dispatch(q, kWork, INFINITE)) {
+    }
+    drained.set_value();
+  });
+  const bool stopped = completion.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  Check(stopped, "XTaskQueueDispatch(INFINITE) returns false after termination drains the port");
+  if (!stopped) std::exit(1);
+  dispatcher.join();
   Check(c.calls == 1 && c.canceled == 1 && g_tq.IsEmpty(q, kWork), "XTaskQueueIsEmpty is true once the canceled callback was delivered");
   g_tq.Close(q);
 }

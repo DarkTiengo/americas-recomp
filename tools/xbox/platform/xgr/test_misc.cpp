@@ -242,6 +242,42 @@ static void CheckTermination() {
   g_tq.Close(q);
 }
 
+static HRESULT CALLBACK CompleteAsync(AsyncBlock*) { return S_OK; }
+
+static void CheckDefaultQueue() {
+  auto get = g_tq.api.At<bool (*)(void*, void**)>(25, "XTaskQueueGetCurrentProcessTaskQueue");
+  auto set = g_tq.api.At<void (*)(void*, void*)>(26, "XTaskQueueSetCurrentProcessTaskQueue");
+  auto duplicate = g_tq.api.At<HRESULT (*)(void*, void*, void**)>(15, "XTaskQueueDuplicateHandle");
+  auto asyncRun = g_tq.api.At<HRESULT (*)(void*, AsyncBlock*, HRESULT (CALLBACK*)(AsyncBlock*))>(6, "XAsyncRun");
+  void* previous = nullptr;
+  get(g_tq.api.self, &previous);
+  void* q = nullptr;
+  if (g_tq.Create(kManual, kManual, &q) != S_OK) {
+    Check(false, "create a replacement process queue");
+    g_tq.Close(previous);
+    return;
+  }
+  set(g_tq.api.self, q);
+  void* copy = nullptr;
+  Check(duplicate(g_tq.api.self, nullptr, &copy) == S_OK && copy == q,
+        "a null queue duplicates the configured process queue");
+  g_tq.Close(copy);
+  Counter c;
+  Check(g_tq.Submit(nullptr, kWork, &c, Count) == S_OK &&
+        g_tq.Dispatch(nullptr, kWork, 0) && c.calls == 1,
+        "dispatch with a null queue services the process queue");
+  set(g_tq.api.self, nullptr);
+  constexpr HRESULT noQueue = static_cast<HRESULT>(0x800701ABu);
+  AsyncBlock block{};
+  Check(asyncRun(g_tq.api.self, &block, CompleteAsync) == noQueue,
+        "an async block without a queue gets E_NO_TASK_QUEUE when the process queue is disabled");
+  Check(g_tq.Submit(nullptr, kWork, &c, Count) == noQueue,
+        "queue submission reports E_NO_TASK_QUEUE when the process queue is disabled");
+  set(g_tq.api.self, previous);
+  g_tq.Close(previous);
+  g_tq.Close(q);
+}
+
 static void CheckComposite() {
   void* q = nullptr;
   g_tq.Create(kManual, kManual, &q);
@@ -459,6 +495,7 @@ int main() {
   CheckGameEvent();
   CheckHandleTracking();
   CheckPendingInvites();
+  CheckDefaultQueue();
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
   return g_failures ? 1 : 0;
 }

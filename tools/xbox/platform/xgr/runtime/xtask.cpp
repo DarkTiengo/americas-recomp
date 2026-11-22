@@ -69,6 +69,7 @@ struct Queue {
   std::condition_variable idle;
   long inflight = 0;
   bool terminated = false;
+  bool dispatch_finished = false;
   std::map<uint64_t, Monitor> monitors;
   std::map<uint64_t, Waiter*> waiters;
 };
@@ -86,17 +87,29 @@ void release(Queue* q) {
   delete q;
 }
 
-Item begin_item(Queue* q, PortId port_id, Callback cb, void* ctx) {
+bool is_terminated(Queue* q) {
+  std::lock_guard<std::mutex> lock(q->m);
+  return q->terminated;
+}
+
+bool dispatch_finished(Queue* q) {
+  std::lock_guard<std::mutex> lock(q->m);
+  return q->dispatch_finished;
+}
+
+bool begin_item(Queue* q, PortId port_id, Callback cb, void* ctx, Item& item) {
+  std::lock_guard<std::mutex> lock(q->m);
+  if (q->terminated) return false;
   add_ref(q);
   Port* port = q->ports[static_cast<uint32_t>(port_id)];
   port->outstanding.fetch_add(1, std::memory_order_acq_rel);
-  std::lock_guard<std::mutex> lock(q->m);
   ++q->inflight;
-  return {cb, ctx, q, false, port};
+  item = {cb, ctx, q, false, port};
+  return true;
 }
 
 void finish_item(const Item& item, bool canceled) {
-  item.cb(item.ctx, canceled || item.canceled);
+  item.cb(item.ctx, canceled || item.canceled || is_terminated(item.owner));
   item.port->outstanding.fetch_sub(1, std::memory_order_acq_rel);
   Queue* q = item.owner;
   {
@@ -193,11 +206,6 @@ std::condition_variable g_delay_cv;
 std::multimap<ULONGLONG, Delayed> g_delayed;
 bool g_delay_thread_started = false;
 
-bool is_terminated(Queue* q) {
-  std::lock_guard<std::mutex> lock(q->m);
-  return q->terminated;
-}
-
 void delay_thread() {
   std::unique_lock<std::mutex> lock(g_delay_m);
   for (;;) {
@@ -241,6 +249,32 @@ std::unique_ptr<Port> make_port(DispatchMode mode, Queue* owner) {
   p->mode = mode;
   p->owner = owner;
   return p;
+}
+
+struct Termination {
+  Queue* q;
+  void* context;
+  TerminatedCallback callback;
+};
+
+void finish_termination(const Termination& termination) {
+  Queue* q = termination.q;
+  {
+    std::unique_lock<std::mutex> lock(q->m);
+    q->idle.wait(lock, [q] { return q->inflight == 0; });
+    q->dispatch_finished = true;
+  }
+  for (Port* p : q->ports) {
+    std::lock_guard<std::mutex> lock(p->m);
+    p->cv.notify_all();
+  }
+  if (termination.callback) termination.callback(termination.context);
+  release(q);
+}
+
+VOID CALLBACK tp_finish_termination(PTP_CALLBACK_INSTANCE, PVOID context) {
+  std::unique_ptr<Termination> termination(static_cast<Termination*>(context));
+  finish_termination(*termination);
 }
 
 bool valid_mode(DispatchMode m) { return static_cast<uint32_t>(m) <= 3; }
@@ -297,13 +331,13 @@ bool Dispatch(Queue* q, PortId port, uint32_t timeout_ms) {
   {
     std::unique_lock<std::mutex> lock(p->m);
     if (p->items.empty() && timeout_ms) {
-      auto ready = [p] { return !p->items.empty(); };
+      auto ready = [p, q] { return !p->items.empty() || dispatch_finished(q); };
       if (timeout_ms == INFINITE)
         p->cv.wait(lock, ready);
       else
         p->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready);
     }
-    if (p->items.empty()) return false;
+    if (p->items.empty() || dispatch_finished(q)) return false;
     item = p->items.front();
     p->items.pop_front();
   }
@@ -316,14 +350,11 @@ HRESULT Submit(Queue* q, PortId port, void* ctx, Callback cb) {
   bool borrowed = false;
   q = resolve(q, &borrowed);
   if (!q) return E_INVALIDARG;
-  HRESULT hr = S_OK;
-  if (is_terminated(q)) {
-    hr = E_ABORT;
-  } else {
-    enqueue(q, port, begin_item(q, port, cb, ctx));
-  }
+  Item item;
+  const bool started = begin_item(q, port, cb, ctx, item);
+  if (started) enqueue(q, port, item);
   if (!borrowed) Close(q);
-  return hr;
+  return started ? S_OK : E_ABORT;
 }
 
 HRESULT SubmitDelayed(Queue* q, PortId port, uint32_t delay_ms, void* ctx, Callback cb) {
@@ -332,21 +363,22 @@ HRESULT SubmitDelayed(Queue* q, PortId port, uint32_t delay_ms, void* ctx, Callb
   bool borrowed = false;
   q = resolve(q, &borrowed);
   if (!q) return E_INVALIDARG;
-  HRESULT hr = S_OK;
-  if (is_terminated(q)) {
-    hr = E_ABORT;
-  } else {
-    Delayed d{q, port, begin_item(q, port, cb, ctx)};
+  bool started;
+  {
     std::lock_guard<std::mutex> lock(g_delay_m);
-    if (!g_delay_thread_started) {
-      g_delay_thread_started = true;
-      std::thread(delay_thread).detach();
+    Item item;
+    started = begin_item(q, port, cb, ctx, item);
+    if (started) {
+      if (!g_delay_thread_started) {
+        g_delay_thread_started = true;
+        std::thread(delay_thread).detach();
+      }
+      g_delayed.emplace(GetTickCount64() + delay_ms, Delayed{q, port, item});
+      g_delay_cv.notify_all();
     }
-    g_delayed.emplace(GetTickCount64() + delay_ms, d);
-    g_delay_cv.notify_all();
   }
   if (!borrowed) Close(q);
-  return hr;
+  return started ? S_OK : E_ABORT;
 }
 
 HRESULT Terminate(Queue* q, bool wait, void* ctx, TerminatedCallback cb) {
@@ -391,37 +423,14 @@ HRESULT Terminate(Queue* q, bool wait, void* ctx, TerminatedCallback cb) {
   }
 
   add_ref(q);  // keep alive until the termination callback has run
-  struct Done {
-    Queue* q;
-    void* ctx;
-    TerminatedCallback cb;
-  };
-  auto finish = [](Done d) {
-    {
-      std::unique_lock<std::mutex> lock(d.q->m);
-      d.q->idle.wait(lock, [&] { return d.q->inflight == 0; });
-    }
-    if (d.cb) d.cb(d.ctx);
-    release(d.q);
-  };
-  Done d{q, ctx, cb};
+  const Termination termination{q, ctx, cb};
   if (wait) {
-    finish(d);
+    finish_termination(termination);
   } else {
-    auto* heap = new Done(d);
-    auto tp = [](PTP_CALLBACK_INSTANCE, PVOID p) {
-      std::unique_ptr<Done> dd(static_cast<Done*>(p));
-      Done copy = *dd;
-      {
-        std::unique_lock<std::mutex> lock(copy.q->m);
-        copy.q->idle.wait(lock, [&] { return copy.q->inflight == 0; });
-      }
-      if (copy.cb) copy.cb(copy.ctx);
-      release(copy.q);
-    };
-    if (!TrySubmitThreadpoolCallback(tp, heap, nullptr)) {
+    auto* heap = new Termination(termination);
+    if (!TrySubmitThreadpoolCallback(tp_finish_termination, heap, nullptr)) {
       delete heap;
-      finish(d);
+      finish_termination(termination);
     }
   }
   return S_OK;

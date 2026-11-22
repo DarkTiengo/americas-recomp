@@ -2,6 +2,8 @@
 
 Can an Xbox Series game run on a PC through [AnyPS5](https://github.com/boykopovar/AnyPS5)? The Series X GPU shares the PS5's RDNA2 instruction set, so the first question is whether AnyPS5's shader recompiler can translate the game's shaders. This fork (branch `xbox-series`) answers that with the author's own console dump, and also builds the platform pieces the game needs around the shaders. No game files are included.
 
+> **Notice: pull requests are closed, and a licensing question is open.** Pull request creation is limited to collaborators and will stay that way; the project's goal is shared by [ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida) (no affiliation, claims not verified here), and splitting contributors between two projects helps neither. Separately, [#179](https://github.com/realdody/americas-recomp/issues/179) asks the people who wrote the standalone Xbox tooling (`tools/xbox`, `tools/tests/test_xbox_*.py`, `docs/xbox`) to agree to relicense it under MIT, so that it can be reused by Leonida's contributors. If you wrote any of it, please read that issue and reply there. The recompiler in `core/` is derived from AnyPS5 and stays GPL-2.0-only.
+
 ## Progress
 
 ![Xbox progress map](docs/xbox/progress.svg)

@@ -1,0 +1,62 @@
+version = 1
+
+# Files relicensed under the MIT licence with the agreement of every person who wrote lines in them
+# (the request and the replies are in https://github.com/realdody/americas-recomp/issues/179).
+# Everything not listed here stays under the repository LICENSE (GPL-2.0-only).
+
+[[annotations]]
+path = [
+  "docs/xbox/BVH_CONTAINER.md",
+  "tools/tests/test_xbox_bindings.py",
+  "tools/tests/test_xbox_bvh_shader_scan.py",
+  "tools/tests/test_xbox_dxil_sm66_wave.py",
+  "tools/tests/test_xbox_make_full_results.py",
+  "tools/tests/test_xbox_pe_imports.py",
+  "tools/tests/test_xbox_platform_results.py",
+  "tools/tests/test_xbox_xgr_gen_stub.py",
+  "tools/xbox/addr_scan.py",
+  "tools/xbox/canary.py",
+  "tools/xbox/cmp_e2e.py",
+  "tools/xbox/cmp_phi.py",
+  "tools/xbox/cmp_struct.py",
+  "tools/xbox/cpu_compare_ps.py",
+  "tools/xbox/dxil_probe.py",
+  "tools/xbox/extract_full.py",
+  "tools/xbox/extract_shaders.py",
+  "tools/xbox/harness_guard.py",
+  "tools/xbox/make_full_results.py",
+  "tools/xbox/make_progress_svg.py",
+  "tools/xbox/msvc/pthread.h",
+  "tools/xbox/pipeline_map.py",
+  "tools/xbox/platform/bink_test.cpp",
+  "tools/xbox/platform/bvh_dummy_cs.h",
+  "tools/xbox/platform/bvh_shader_scan.py",
+  "tools/xbox/platform/carve_bink.py",
+  "tools/xbox/platform/d3d12_xs.cpp",
+  "tools/xbox/platform/exe_report.py",
+  "tools/xbox/platform/make_platform_results.py",
+  "tools/xbox/platform/oplower_check.py",
+  "tools/xbox/platform/oplower_kernel.ll",
+  "tools/xbox/platform/pe_imports.py",
+  "tools/xbox/platform/stubgen.py",
+  "tools/xbox/platform/wavelower_check.py",
+  "tools/xbox/platform/wavelower_kernel.ll",
+  "tools/xbox/platform/xgr/test_surface.cpp",
+  "tools/xbox/platform/xmem.cpp",
+  "tools/xbox/platform/xmem_test.py",
+  "tools/xbox/rcp_envelope.py",
+  "tools/xbox/rerun_atomic.py",
+  "tools/xbox/run_batch.py",
+  "tools/xbox/run_bind.py",
+  "tools/xbox/run_corpus_bind.py",
+  "tools/xbox/run_graphics.py",
+  "tools/xbox/run_graphics_final.py",
+  "tools/xbox/run_graphics_table.py",
+  "tools/xbox/run_gs.py",
+  "tools/xbox/run_mesh.py",
+  "tools/xbox/run_variants.py",
+  "tools/xbox/structurizer_corpus.py",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 The americas-recomp contributors"
+SPDX-License-Identifier = "MIT"
